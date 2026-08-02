@@ -1,0 +1,108 @@
+name: Alpenglow bounty scope watcher
+
+on:
+  schedule:
+    # Twice an hour. GitHub cron can be delayed a few minutes at busy times;
+    # the state-based overlap window (below) absorbs that.
+    - cron: '0,30 * * * *'
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alpenglow-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout watcher state
+        uses: actions/checkout@v4
+
+      - name: Check anza-xyz/agave master for new in-scope commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/anza-xyz/agave"
+          STATE_DIR="state"
+          TIME_FILE="$STATE_DIR/last-check.txt"
+          SEEN_FILE="$STATE_DIR/last-seen-shas.txt"
+          mkdir -p "$STATE_DIR"
+          touch "$SEEN_FILE"
+
+          # Regex of the frozen in-scope surface (RULES.md, anza-xyz/alpenglow, section 3)
+          PATTERN='^(votor/|votor-messages/|bls-sigverify/|bls-cert-verify/|core/src/cluster_info_vote_listener\.rs$|core/src/block_creation_loop/rewards/|runtime/src/validated_reward_certificate\.rs$|runtime/src/validated_block_finalization\.rs$|runtime/src/epoch_stakes\.rs$|runtime/src/block_component_processor\.rs$|runtime/src/block_component_processor/vote_reward\.rs$|entry/src/block_component\.rs$|runtime/src/alpenglow_epoch_type\.rs$|runtime/src/bank\.rs$|runtime/src/bank_forks\.rs$|core/src/repair/block_id_repair_service\.rs$|core/src/repair/repair_handler\.rs$|core/src/repair/serve_repair\.rs$|core/src/replay_stage\.rs$|core/src/replay_stage/update_parent\.rs$|ledger/src/blockstore_processor\.rs$|turbine/src/retransmit_stage\.rs$|core/src/window_service\.rs$)'
+
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # 10-minute overlap so a slightly-delayed cron run never loses a commit at the boundary;
+          # SEEN_FILE below guards against re-notifying the same commit because of that overlap.
+          NEXT_SINCE=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+
+          if [ ! -s "$TIME_FILE" ]; then
+            echo "No prior state — seeding, no notification this run."
+            echo "$NEXT_SINCE" > "$TIME_FILE"
+            exit 0
+          fi
+
+          SINCE=$(cat "$TIME_FILE")
+
+          COMMITS_JSON=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/commits?sha=master&since=${SINCE}&per_page=100")
+
+          SHAS=$(echo "$COMMITS_JSON" | jq -r '.[].sha' 2>/dev/null || true)
+
+          NEW_SEEN_TMP=$(mktemp)
+          cp "$SEEN_FILE" "$NEW_SEEN_TMP"
+
+          for sha in $SHAS; do
+            if grep -qx "$sha" "$SEEN_FILE"; then
+              continue
+            fi
+            echo "$sha" >> "$NEW_SEEN_TMP"
+
+            COMMIT_JSON=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}/commits/${sha}")
+            FILES=$(echo "$COMMIT_JSON" | jq -r '.files[]?.filename' 2>/dev/null || true)
+            MATCHES=$(echo "$FILES" | grep -E "$PATTERN" || true)
+
+            if [ -n "$MATCHES" ]; then
+              SUBJECT=$(echo "$COMMIT_JSON" | jq -r '.commit.message' | head -1)
+              AUTHOR=$(echo "$COMMIT_JSON" | jq -r '.commit.author.name')
+              WHEN=$(echo "$COMMIT_JSON" | jq -r '.commit.author.date')
+              SHORT=${sha:0:7}
+              MSG="⚠️ Alpenglow watcher: in-scope commit on agave master
+${SHORT} by ${AUTHOR} at ${WHEN}
+${SUBJECT}
+https://github.com/anza-xyz/agave/commit/${sha}
+Files:
+$(echo "$MATCHES" | sed 's/^/  - /')"
+              MSG="${MSG:0:4000}"
+
+              curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=${MSG}" \
+                -o /dev/null
+              echo "Notified: ${SHORT} ${SUBJECT}"
+            fi
+          done
+
+          # Keep the seen-list bounded (last 1000 SHAs) and update state.
+          awk 'NF' "$NEW_SEEN_TMP" | tail -n 1000 | sort -u > "$SEEN_FILE"
+          rm -f "$NEW_SEEN_TMP"
+          echo "$NEXT_SINCE" > "$TIME_FILE"
+
+      - name: Commit updated state
+        run: |
+          git config user.name "alpenglow-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/
+          git diff --cached --quiet || git commit -m "chore: update watcher state"
+          git push
