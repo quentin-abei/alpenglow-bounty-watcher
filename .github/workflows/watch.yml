@@ -5,7 +5,12 @@ on:
     # Twice an hour. GitHub cron can be delayed a few minutes at busy times;
     # the state-based overlap window (below) absorbs that.
     - cron: '0,30 * * * *'
-  workflow_dispatch: {} # lets you trigger it manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Send a one-off test Telegram message and exit (does not touch state)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -28,6 +33,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
+
+          if [ "${{ github.event.inputs.test_notify }}" = "true" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=✅ Alpenglow watcher: test message, credentials OK." \
+              -o /dev/null
+            echo "Test message sent."
+            exit 0
+          fi
 
           API="https://api.github.com/repos/anza-xyz/agave"
           STATE_DIR="state"
