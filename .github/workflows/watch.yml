@@ -92,12 +92,8 @@ jobs:
               AUTHOR=$(echo "$COMMIT_JSON" | jq -r '.commit.author.name')
               WHEN=$(echo "$COMMIT_JSON" | jq -r '.commit.author.date')
               SHORT=${sha:0:7}
-              MSG="⚠️ Alpenglow watcher: in-scope commit on agave master
-${SHORT} by ${AUTHOR} at ${WHEN}
-${SUBJECT}
-https://github.com/anza-xyz/agave/commit/${sha}
-Files:
-$(echo "$MATCHES" | sed 's/^/  - /')"
+              MSG=$(printf '⚠️ Alpenglow watcher: in-scope commit on agave master\n%s by %s at %s\n%s\nhttps://github.com/anza-xyz/agave/commit/%s\nFiles:\n%s' \
+                "$SHORT" "$AUTHOR" "$WHEN" "$SUBJECT" "$sha" "$(echo "$MATCHES" | sed 's/^/  - /')")
               MSG="${MSG:0:4000}"
 
               curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
